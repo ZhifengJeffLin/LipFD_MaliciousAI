@@ -1,11 +1,10 @@
-import os
 import cv2
-import numpy as np
+import cv2
 import librosa
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+import numpy as np
 from librosa import feature as audio
-
+from tqdm import tqdm
 
 """
 Structure of the AVLips dataset:
@@ -18,13 +17,83 @@ AVLips
 """
 
 ############ Custom parameter ##############
-N_EXTRACT = 10   # number of extracted images from video
-WINDOW_LEN = 5   # frames of each window
-MAX_SAMPLE = 100 
+# =================== Config: paths + custom params ===================
+from pathlib import Path
+import argparse, os
 
-audio_root = "./AVLips/wav"
-video_root = "./AVLips"
-output_root = "./datasets/AVLips"
+
+def _resolve_config():
+    # 只解析我们关心的参数，不干扰你后面自己的 argparse
+    p = argparse.ArgumentParser(add_help=False)
+
+    # 路径相关
+    p.add_argument('--root', type=str, default=None,
+                   help='工程根目录；不传则使用脚本所在目录')
+    p.add_argument('--audio_root', type=str, default=None,
+                   help='音频目录，默认 <root>/AVLips/wav')
+    p.add_argument('--video_root', type=str, default=None,
+                   help='视频/图像目录，默认 <root>/AVLips')
+    p.add_argument('--output_root', type=str, default=None,
+                   help='输出目录，默认 <root>/datasets/AVLips')
+
+    # 你的自定义参数（提供默认值，并允许覆盖）
+    p.add_argument('--n_extract', type=int, default=10, help='number of extracted images from video')
+    p.add_argument('--window_len', type=int, default=5, help='frames of each window')
+    p.add_argument('--max_sample', type=int, default=100, help='max samples to process')
+
+    args, _ = p.parse_known_args()
+
+    # 基准根目录（默认=脚本目录）
+    script_dir = Path(__file__).resolve().parent
+    root = Path(args.root).resolve() if args.root else script_dir
+
+    # 具体路径（若未传参则使用默认）
+    audio = Path(args.audio_root).resolve() if args.audio_root else (root / 'AVLips' / 'wav')
+    video = Path(args.video_root).resolve() if args.video_root else (root / 'AVLips')
+    output = Path(args.output_root).resolve() if args.output_root else (root / 'datasets' / 'AVLips')
+
+    # 创建输出目录
+    output.mkdir(parents=True, exist_ok=True)
+
+    # 一点健壮性检查
+    if args.n_extract <= 0:  raise ValueError('--n_extract must be > 0')
+    if args.window_len <= 0: raise ValueError('--window_len must be > 0')
+    if args.max_sample <= 0: raise ValueError('--max_sample must be > 0')
+
+    return {
+        'AUDIO_ROOT': audio,
+        'VIDEO_ROOT': video,
+        'OUTPUT_ROOT': output,
+        'N_EXTRACT': args.n_extract,
+        'WINDOW_LEN': args.window_len,
+        'MAX_SAMPLE': args.max_sample,
+        'SCRIPT_DIR': script_dir
+    }
+
+
+_cfg = _resolve_config()
+
+# 推荐使用的大写常量
+AUDIO_ROOT = _cfg['AUDIO_ROOT']
+VIDEO_ROOT = _cfg['VIDEO_ROOT']
+OUTPUT_ROOT = _cfg['OUTPUT_ROOT']
+N_EXTRACT = _cfg['N_EXTRACT']
+WINDOW_LEN = _cfg['WINDOW_LEN']
+MAX_SAMPLE = _cfg['MAX_SAMPLE']
+SCRIPT_DIR = _cfg['SCRIPT_DIR']
+
+# 兼容你原来的小写变量名（如果后面代码还在用它们）
+audio_root = AUDIO_ROOT
+video_root = VIDEO_ROOT
+output_root = OUTPUT_ROOT
+
+print(f"[paths] script_dir = {SCRIPT_DIR}")
+print(f"[paths] audio_root = {AUDIO_ROOT}")
+print(f"[paths] video_root = {VIDEO_ROOT}")
+print(f"[paths] output_root= {OUTPUT_ROOT}")
+print(f"[params] N_EXTRACT={N_EXTRACT}  WINDOW_LEN={WINDOW_LEN}  MAX_SAMPLE={MAX_SAMPLE}")
+# ====================================================================
+
 ############################################
 
 labels = [(0, "0_real"), (1, "1_fake")]
