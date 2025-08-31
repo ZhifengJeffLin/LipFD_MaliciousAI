@@ -1,5 +1,4 @@
 import cv2
-import cv2
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
@@ -174,6 +173,17 @@ def run():
                         plt.imsave(
                             f"{output_root}/{dataset_name}/{name}_{group}.png", x
                         )
+                        # 新增：同时写入 mix/，用类名前缀避免重名
+                        cls_prefix = "real" if label == 0 else "fake"
+                        mix_path = Path(output_root) / "mix"
+                        mix_path.mkdir(parents=True, exist_ok=True)
+                        dst = mix_path / f"{cls_prefix}_{name}_{group}.png"
+                        k = 1
+                        while dst.exists():
+                            dst = mix_path / f"{cls_prefix}_{name}_{group}_{k}.png"
+                            k += 1
+                        plt.imsave(dst.as_posix(), x)
+
                         group = group + 1
                     except ValueError:
                         print(f"ValueError: {name}")
