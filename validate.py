@@ -1,10 +1,12 @@
 import argparse
-import torch
+
 import numpy as np
-from data import AVLip
+import torch
 import torch.utils.data
-from models import build_model
 from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score
+
+from data import AVLip
+from models import build_model
 
 
 def validate(model, loader, gpu_id):
@@ -34,8 +36,10 @@ def validate(model, loader, gpu_id):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--real_list_path", type=str, default="./datasets/val/0_real")
-    parser.add_argument("--fake_list_path", type=str, default="./datasets/val/1_fake")
+    # parser.add_argument("--real_list_path", type=str, default="./datasets/val/0_real")
+    # parser.add_argument("--fake_list_path", type=str, default="./datasets/val/1_fake")
+    parser.add_argument("--real_list_path", type=str, default="./datasets/AVLips/0_real")
+    parser.add_argument("--fake_list_path", type=str, default="./datasets/AVLips/1_fake")
     parser.add_argument("--max_sample", type=int, default=1000, help="max number of validate samples")
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--data_label", type=str, default="val")
