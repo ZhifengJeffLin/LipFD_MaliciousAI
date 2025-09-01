@@ -15,11 +15,10 @@ AVLips
     └── 1_fake
 """
 
-############ Custom parameter ##############
 # =================== Config: paths + custom params ===================
 from pathlib import Path
 import argparse, os
-
+import subprocess  # ← 新增：用于调用 ffmpeg
 
 def _resolve_config():
     # 只解析我们关心的参数，不干扰你后面自己的 argparse
@@ -39,6 +38,10 @@ def _resolve_config():
     p.add_argument('--n_extract', type=int, default=10, help='number of extracted images from video')
     p.add_argument('--window_len', type=int, default=5, help='frames of each window')
     p.add_argument('--max_sample', type=int, default=100, help='max samples to process')
+
+    # ← 新增：缺少 wav 时是否自动抽取音轨
+    p.add_argument('--auto_extract_wav', action='store_true',
+                   help='若找不到同名wav，自动用ffmpeg从视频中抽取音轨(单声道,16kHz)')
 
     args, _ = p.parse_known_args()
 
@@ -66,9 +69,9 @@ def _resolve_config():
         'N_EXTRACT': args.n_extract,
         'WINDOW_LEN': args.window_len,
         'MAX_SAMPLE': args.max_sample,
-        'SCRIPT_DIR': script_dir
+        'SCRIPT_DIR': script_dir,
+        'AUTO_EXTRACT_WAV': args.auto_extract_wav,  # ← 新增
     }
-
 
 _cfg = _resolve_config()
 
@@ -80,6 +83,7 @@ N_EXTRACT = _cfg['N_EXTRACT']
 WINDOW_LEN = _cfg['WINDOW_LEN']
 MAX_SAMPLE = _cfg['MAX_SAMPLE']
 SCRIPT_DIR = _cfg['SCRIPT_DIR']
+AUTO_EXTRACT_WAV = _cfg['AUTO_EXTRACT_WAV']  # ← 新增
 
 # 兼容你原来的小写变量名（如果后面代码还在用它们）
 audio_root = AUDIO_ROOT
@@ -90,18 +94,28 @@ print(f"[paths] script_dir = {SCRIPT_DIR}")
 print(f"[paths] audio_root = {AUDIO_ROOT}")
 print(f"[paths] video_root = {VIDEO_ROOT}")
 print(f"[paths] output_root= {OUTPUT_ROOT}")
-print(f"[params] N_EXTRACT={N_EXTRACT}  WINDOW_LEN={WINDOW_LEN}  MAX_SAMPLE={MAX_SAMPLE}")
+print(
+    f"[params] N_EXTRACT={N_EXTRACT}  WINDOW_LEN={WINDOW_LEN}  MAX_SAMPLE={MAX_SAMPLE}  AUTO_EXTRACT_WAV={AUTO_EXTRACT_WAV}")
 # ====================================================================
-
-############################################
 
 labels = [(0, "0_real"), (1, "1_fake")]
 
 def get_spectrogram(audio_file):
-    data, sr = librosa.load(audio_file)
+    data, sr = librosa.load(audio_file, sr=None, mono=True)
     mel = librosa.power_to_db(audio.melspectrogram(y=data, sr=sr), ref=np.min)
     plt.imsave("./temp/mel.png", mel)
 
+
+# ← 新增：极简 ffmpeg 抽取音轨
+def ffmpeg_extract_wav(video_path: str, wav_path: str, sr: int = 16000) -> bool:
+    """用 ffmpeg 从视频抽音轨到 wav（单声道，16kHz）。成功返回 True。"""
+    Path(wav_path).parent.mkdir(parents=True, exist_ok=True)
+    cmd = ['ffmpeg', '-y', '-i', video_path, '-vn', '-ac', '1', '-ar', str(sr), wav_path]
+    try:
+        ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return ret.returncode == 0 and Path(wav_path).exists()
+    except Exception:
+        return False
 
 def run():
     i = 0
@@ -131,9 +145,7 @@ def run():
             ).tolist()
             frame_idx.sort()
             # selected frames
-            frame_sequence = [
-                i for num in frame_idx for i in range(num, num + WINDOW_LEN)
-            ]
+            frame_sequence = [ii for num in frame_idx for ii in range(num, num + WINDOW_LEN)]
             frame_list = []
             current_frame = 0
             while current_frame <= frame_sequence[-1]:
@@ -151,50 +163,51 @@ def run():
             name = v.split(".")[0]
             a = f"{audio_root}/{dataset_name}/{name}.wav"
 
+            # 如果缺少wav：在开启 --auto_extract_wav 时自动抽取；否则跳过该视频
+            if not Path(a).exists():
+                if AUTO_EXTRACT_WAV:
+                    ok = ffmpeg_extract_wav(f"{root}/{v}", a, sr=16000)
+                    if not ok:
+                        print(f"[skip] ffmpeg extract failed: {v} -> {a}")
+                        continue
+                    else:
+                        print(f"[ok] extracted wav: {a}")
+                else:
+                    print(f"[skip] missing wav: {a} (use --auto_extract_wav to enable auto-extraction)")
+                    continue
+
             group = 0
             get_spectrogram(a)
             mel = plt.imread("./temp/mel.png") * 255  # load spectrogram (int)
             mel = mel.astype(np.uint8)
             mapping = mel.shape[1] / frame_count
-            for i in range(len(frame_list)):
-                idx = i % WINDOW_LEN
+            for ii in range(len(frame_list)):
+                idx = ii % WINDOW_LEN
                 if idx == 0:
                     try:
-                        begin = np.round(frame_sequence[i] * mapping)
-                        end = np.round((frame_sequence[i] + WINDOW_LEN) * mapping)
-                        sub_mel = cv2.resize(
-                            (mel[:, int(begin) : int(end)]), (500 * WINDOW_LEN, 500)
-                        )
-                        x = np.concatenate(frame_list[i : i + WINDOW_LEN], axis=1)
-                        # print(x.shape)
-                        # print(sub_mel.shape)
+                        begin = np.round(frame_sequence[ii] * mapping)
+                        end = np.round((frame_sequence[ii] + WINDOW_LEN) * mapping)
+                        sub_mel = cv2.resize((mel[:, int(begin): int(end)]), (500 * WINDOW_LEN, 500))
+                        x = np.concatenate(frame_list[ii: ii + WINDOW_LEN], axis=1)
                         x = np.concatenate((sub_mel[:, :, :3], x[:, :, :3]), axis=0)
-                        # print(x.shape)
-                        plt.imsave(
-                            f"{output_root}/{dataset_name}/{name}_{group}.png", x
-                        )
-                        # 新增：同时写入 mix/，用类名前缀避免重名
-                        cls_prefix = "real" if label == 0 else "fake"
-                        mix_path = Path(output_root) / "mix"
-                        mix_path.mkdir(parents=True, exist_ok=True)
-                        dst = mix_path / f"{cls_prefix}_{name}_{group}.png"
-                        k = 1
-                        while dst.exists():
-                            dst = mix_path / f"{cls_prefix}_{name}_{group}_{k}.png"
-                            k += 1
-                        plt.imsave(dst.as_posix(), x)
+                        plt.imsave(f"{output_root}/{dataset_name}/{name}_{group}.png", x)
 
-                        group = group + 1
+                        # 同时写入 mix/，用类名前缀避免重名
+                        # cls_prefix = "real" if label == 0 else "fake"
+                        # mix_path = Path(output_root) / "mix"
+                        # mix_path.mkdir(parents=True, exist_ok=True)
+                        # dst = mix_path / f"{cls_prefix}_{name}_{group}.png"
+                        # k = 1
+                        # while dst.exists():
+                        #     dst = mix_path / f"{cls_prefix}_{name}_{group}_{k}.png"
+                        #     k += 1
+                        # plt.imsave(dst.as_posix(), x)
+
+                        group += 1
                     except ValueError:
                         print(f"ValueError: {name}")
                         continue
-            # print(frame_sequence)
-            # print(frame_count)
-            # print(mel.shape[1])
-            # print(mapping)
-            # exit(0)
         i += 1
-
 
 if __name__ == "__main__":
     if not os.path.exists(output_root):
