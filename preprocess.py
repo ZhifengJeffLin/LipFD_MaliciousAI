@@ -14,7 +14,7 @@ Flattened mode:
 
 # =================== Config: paths + custom params ===================
 from pathlib import Path
-import argparse, os, subprocess, shutil
+import argparse, os, subprocess, shutil, re
 
 
 def _resolve_config():
@@ -132,22 +132,100 @@ def ffmpeg_extract_wav(video_path: Path, wav_path: Path, sr: int = 16000) -> boo
         return False
 
 
+def _is_numeric_stem(stem: str) -> bool:
+    # 仅纯数字视为“已规范”
+    return bool(re.fullmatch(r'\d+', stem))
+
+
+def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
+    """
+    将 video_dir 下的所有视频文件重命名为数字序列（从 0 起、跳过已占用的数字）。
+    - 已经是纯数字名的文件不改名（[keep]）
+    - 非数字名的按序改名（[rename] old -> new）
+    - 若 audio_dir 下有与旧名同 stem 的 wav，则尝试同步改名（冲突时跳过并提示）
+    """
+    exts = {'.mp4', '.mov', '.mkv', '.avi', '.mpg', '.mpeg', '.m4v', '.webm'}
+    files = [p for p in sorted(video_dir.iterdir()) if p.is_file() and p.suffix.lower() in exts]
+    if not files:
+        print(f"[normalize] no video files in: {video_dir}")
+        return
+
+    # 已占用数字集合（来自已是数字名的视频）
+    used = set()
+    for p in files:
+        if _is_numeric_stem(p.stem):
+            try:
+                used.add(int(p.stem))
+            except Exception:
+                pass
+
+    renamed = 0
+    kept = 0
+    next_id = 0
+
+    print(f"[normalize] start renaming to numeric filenames under: {video_dir}")
+    for p in files:
+        stem = p.stem
+        if _is_numeric_stem(stem):
+            print(f"[keep]  {p.name}")
+            kept += 1
+            continue
+
+        # 找下一个未占用的整数 ID
+        while next_id in used:
+            next_id += 1
+        new_name = f"{next_id}{p.suffix.lower()}"
+        dst = p.with_name(new_name)
+
+        # 若目标已存在（极少见，通常因为别的文件名刚好抢占了该 ID），则继续找空位
+        while dst.exists():
+            next_id += 1
+            while next_id in used:
+                next_id += 1
+            new_name = f"{next_id}{p.suffix.lower()}"
+            dst = p.with_name(new_name)
+
+        # 执行视频重命名
+        p.rename(dst)
+        print(f"[rename] {p.name} -> {dst.name}")
+        used.add(next_id)
+        renamed += 1
+
+        # 同步重命名已有 wav（若存在）
+        old_wav = audio_dir / f"{stem}.wav"
+        new_wav = audio_dir / f"{next_id}.wav"
+        if old_wav.exists():
+            try:
+                if new_wav.exists():
+                    print(f"[wav-skip] {old_wav.name} -> {new_wav.name} (target exists)")
+                else:
+                    old_wav.rename(new_wav)
+                    print(f"[wav-rename] {old_wav.name} -> {new_wav.name}")
+            except Exception as e:
+                print(f"[wav-warn] rename failed: {old_wav.name} -> {new_wav.name} ({e})")
+
+        next_id += 1
+
+    print(f"[normalize] done. kept={kept}, renamed={renamed}, total={len(files)}")
+
+
 def run():
-    # —— 若启用自动抽取，则在开始前清空目标 audio_root
+    # —— 若启用自动抽取，则在开始前清空目标 audio_root（防止残留对齐不上）
     if AUTO_EXTRACT_WAV:
         try:
-            # 一些极简防呆：避免误删视频目录或根目录
             if Path(audio_root).resolve() == Path(video_root).resolve():
                 raise RuntimeError(f"[abort] audio_root == video_root, refuse to wipe: {audio_root}")
             if str(Path(audio_root).resolve()) in ("\\", "/", ""):
                 raise RuntimeError(f"[abort] suspicious audio_root: {audio_root}")
-            # 真正清空
             if Path(audio_root).exists():
                 print(f"[clean] clearing audio_root: {Path(audio_root).resolve()}")
                 shutil.rmtree(Path(audio_root))
             Path(audio_root).mkdir(parents=True, exist_ok=True)
         except Exception as e:
             print(f"[warn] failed to clean audio_root: {e}")
+
+    # 0) 先把视频文件名规范化为数字
+    normalize_video_filenames(Path(video_root), Path(audio_root))
 
     # 1) 枚举 video_root 下的视频（不再分子目录）
     exts = {'.mp4', '.mov', '.mkv', '.avi', '.mpg', '.mpeg', '.m4v', '.webm'}
@@ -194,7 +272,7 @@ def run():
             continue
 
         # 2) 音频：默认放在 <video_root>/../wav/<basename(video_root)>/<name>.wav
-        name = vpath.stem
+        name = vpath.stem  # 现在已经是数字字符串
         wav_file = Path(audio_root) / f"{name}.wav"
 
         if not wav_file.exists():
