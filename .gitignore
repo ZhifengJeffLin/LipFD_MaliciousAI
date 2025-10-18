@@ -2,7 +2,10 @@
 __pycache__
 .vscode/
 *.pth
-*.csv
+/work/*.csv
+/work/*.txt
+/work/*.json
 /datasets/AVLips
+/datasets/large
 /samples/wav
 /samples_clips

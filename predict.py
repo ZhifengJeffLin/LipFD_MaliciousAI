@@ -230,7 +230,7 @@ def main():
         items_sorted, scores = infer_group(model, device, items, TMP_ROOT, BATCH_SIZE)
         preds = [1 if s >= THRESH else 0 for s in scores]
         gt = GT_LABELS.get(sid, None)
-
+        print(f"[inferred] sample_id={sid} | num_images={len(items_sorted)} | gt={gt if gt is not None else 'N/A'}")
         # —— 逐图结果
         for it, s, y in zip(items_sorted, scores, preds):
             pred_name = "fake" if y == 1 else "real"

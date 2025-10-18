@@ -1,0 +1,13 @@
+{
+  "AUC": 0.9868,
+  "EER": 0.04,
+  "thr_at_EER(score)": 0.506,
+  "FPR@EER": 0.05,
+  "FNR@EER": 0.03,
+  "N_real": 100,
+  "N_fake": 100,
+  "roc_png": "C:\\_dev\\_code\\python\\LipFD\\work\\large\\roc_curve.png",
+  "score_dist_png": "C:\\_dev\\_code\\python\\LipFD\\work\\large\\score_distributions.png",
+  "reliability_png": null,
+  "eer_table_csv": "C:\\_dev\\_code\\python\\LipFD\\work\\large\\eer_predictions.csv"
+}
