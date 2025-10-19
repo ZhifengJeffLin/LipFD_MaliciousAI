@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image  # 用于轻量估计 mel 能量与唇条带运动
 from torch.utils.data import DataLoader
 
 # ---------- 默认参数（不传命令行时就用这些） ----------
@@ -73,16 +72,17 @@ def gather_groups(input_dirs: list[Path]):
     """
     groups = defaultdict(list)
     for d in input_dirs:
-        prefix = d.name
+        prefix = d.name  # 最后一级目录名作为前缀
         for p in list_images(d):
             filename = p.name
             sid = sample_key_from_name(filename)
-            sample_key = f"{prefix}_{sid}"
-            dst_name = f"{prefix}__{filename}"
+            sample_key = f"{prefix}_{sid}"  # 显示与聚合用
+            dst_name = f"{prefix}__{filename}"  # 临时目录里避免同名冲突
             groups[sample_key].append({
                 "path": p, "prefix": prefix, "filename": filename,
                 "dst_name": dst_name, "sample_key": sample_key
             })
+    # 组内按文件名排序
     for k in list(groups.keys()):
         groups[k] = sorted(groups[k], key=lambda it: it["filename"])
     return groups
@@ -94,6 +94,7 @@ def prepare_tmp_group(items, tmp_root: Path):
         shutil.rmtree(tmp_root, ignore_errors=True)
     (tmp_root / "real").mkdir(parents=True, exist_ok=True)
     (tmp_root / "gen").mkdir(parents=True, exist_ok=True)
+    # 为了和数据集读取顺序对齐，按 dst_name 排序后复制
     items_sorted = sorted(items, key=lambda it: it["dst_name"])
     for it in items_sorted:
         shutil.copyfile(it["path"], tmp_root / "real" / it["dst_name"])
@@ -103,11 +104,15 @@ def prepare_tmp_group(items, tmp_root: Path):
 
 @torch.no_grad()
 def infer_group(model, device, items, tmp_root: Path, batch_size=8):
-    """对一组图做一次批量推理。返回: (items_sorted, scores)。"""
+    """
+    对一组图做一次批量推理。
+    返回: (items_sorted, scores) 保证 scores 与 items_sorted 一一对应。
+    """
     items_sorted, real_dir, fake_dir = prepare_tmp_group(items, tmp_root)
 
     class Opt:
         ...
+
     opt = Opt()
     opt.real_list_path = real_dir
     opt.fake_list_path = fake_dir
@@ -126,93 +131,25 @@ def infer_group(model, device, items, tmp_root: Path, batch_size=8):
         img = img.to(device)
         crops = [[t.to(device) for t in sub] for sub in crops]
         feats = model.get_features(img).to(device)
-        prob = torch.sigmoid(model(crops, feats)[0]).flatten()
+        prob = torch.sigmoid(model(crops, feats)[0]).flatten()  # [B]
         scores.extend(prob.cpu().numpy().tolist())
     return items_sorted, scores
 
 
-# ----------------------- 轻量启发式（用于“全 0 饱和”兜底） -----------------------
-def _mel_mean01(img_path: Path, lip_ratio=0.33) -> float:
-    """估计合成图 mel 区域的平均亮度（0~1）。"""
-    try:
-        im = Image.open(img_path).convert("L")
-        W, H = im.size
-        lip_h = int(H * lip_ratio)
-        mel = np.asarray(im.crop((0, 0, W, max(1, H - lip_h))), dtype=np.float32) / 255.0
-        return float(mel.mean())
-    except Exception:
-        return 0.0
-
-
-def _lip_motion_score(img_path: Path, lip_ratio=0.33, n_tiles=5) -> float:
-    """估计唇条带的“静态程度”（相邻竖条的平均差，越小越静）。"""
-    try:
-        im = Image.open(img_path).convert("L")
-        W, H = im.size
-        lip_h = int(H * lip_ratio)
-        lip = np.asarray(im.crop((0, max(0, H - lip_h), W, H)), dtype=np.float32) / 255.0
-        tile_w = max(1, W // n_tiles)
-        tiles = [lip[:, i * tile_w:(i + 1) * tile_w] for i in range(n_tiles)]
-        diffs = [float(np.mean(np.abs(tiles[i] - tiles[i + 1]))) for i in range(n_tiles - 1)]
-        if not diffs:
-            return 0.0
-        return float(np.mean(diffs))
-    except Exception:
-        return 0.0
-
-
-def _sa0_decide(scores: np.ndarray,
-                mel_means: np.ndarray,
-                lip_motion: np.ndarray,
-                eps=1e-4, min_frac_low=0.95,
-                mel_thresh=0.20, need_mel_frac=0.60,
-                lip_tau=0.02, need_static_frac=0.60,
-                flat_mu=1e-3, flat_sigma=1e-3):
-    """
-    触发条件：near-zero 且（mel-active 或 lip-static 或 flatline）。
-    返回: (trigger, reason, diag_dict)
-    """
-    s = np.asarray(scores, dtype=float)
-    if s.size == 0:
-        return False, "", dict(frac_low=0.0, frac_mel=0.0, frac_lip=0.0, mu=float("nan"), sigma=float("nan"))
-
-    frac_low = float((s < eps).mean())
-    mu = float(s.mean())
-    sigma = float(s.std())
-
-    frac_mel = float((mel_means >= mel_thresh).mean()) if mel_means.size else 0.0
-    frac_lip = float((lip_motion <= lip_tau).mean()) if lip_motion.size else 0.0
-
-    cond_near_zero = (frac_low >= min_frac_low)
-    cond_mel = (frac_mel >= need_mel_frac)
-    cond_lip = (frac_lip >= need_static_frac)
-    cond_flat = (mu <= flat_mu) and (sigma <= flat_sigma)
-
-    trigger = cond_near_zero and (cond_mel or cond_lip or cond_flat)
-    reasons = []
-    if cond_mel: reasons.append("mel")
-    if cond_lip: reasons.append("lip")
-    if cond_flat: reasons.append("flat")
-    reason = "+".join(reasons) if trigger else ""
-
-    diag = dict(frac_low=frac_low, frac_mel=frac_mel, frac_lip=frac_lip, mu=mu, sigma=sigma)
-    return trigger, reason, diag
-
-
-# ------------------------------------------------------------------
-
-
 def print_table(headers, rows, col_w=None):
+    """简单表格打印（不引第三方包）"""
     if col_w is None:
         col_w = [max(len(str(h)), *(len(str(r[i])) for r in rows)) + 2 for i, h in enumerate(headers)]
     line = '+' + '+'.join('-' * w for w in col_w) + '+'
+
     def fmt_row(r):
         return '|' + '|'.join(str(x).ljust(w) for x, w in zip(r, col_w)) + '|'
 
-    print(line);
-    print(fmt_row(headers));
     print(line)
-    for r in rows: print(fmt_row(r))
+    print(fmt_row(headers))
+    print(line)
+    for r in rows:
+        print(fmt_row(r))
     print(line)
 
 
@@ -234,34 +171,8 @@ def parse_args():
     p.add_argument("--per_image_csv", type=str, default=DEFAULTS["per_image_csv"])
     p.add_argument("--per_sample_csv", type=str, default=DEFAULTS["per_sample_csv"])
     p.add_argument("--gt_json", type=str, default=DEFAULTS["gt_json"],
-                   help="可选：JSON {'sample_id': 0/1, ...}；sample_id 使用前缀格式（如 mix_0）")
+                   help="可选：JSON 文件路径，内容为 {'sample_id': 0/1, ...}；sample_id 需使用前缀格式（如 mix_0）")
     p.add_argument("--preview_n", type=int, default=DEFAULTS["preview_n"])
-
-    # —— SA0/ZS（几乎全 0 + 触发项）跨域兜底（默认关闭）
-    p.add_argument("--sa0_on", action="store_true",
-                   help="Rescue when almost all per-image scores ≈ 0 but mel/lip/flatline indicates anomaly.")
-    p.add_argument("--sa0_eps", type=float, default=1e-4,
-                   help="Near-zero threshold for per-image scores.")
-    p.add_argument("--sa0_min_frac_low", type=float, default=0.90,
-                   help=">= this fraction of frames are near-zero to consider saturation.")
-    p.add_argument("--sa0_mel_thresh", type=float, default=0.03,
-                   help="mel mean (0~1) considered active if >= this.")
-    p.add_argument("--sa0_need_mel_frac", type=float, default=0.40,
-                   help=">= this fraction of frames need active mel.")
-    p.add_argument("--lip_static_tau", type=float, default=0.010,
-                   help="lip motion <= tau -> static.")
-    p.add_argument("--need_static_frac", type=float, default=0.60,
-                   help=">= this fraction of frames need to be static lips.")
-    p.add_argument("--flat_mu", type=float, default=1e-3,
-                   help="mean(score) <= flat_mu indicates near-zero mean.")
-    p.add_argument("--flat_sigma", type=float, default=1e-3,
-                   help="std(score) <= flat_sigma indicates near-zero variance.")
-    p.add_argument("--sa0_mode", type=str, default="floor", choices=["floor", "override"],
-                   help="floor: lift scores to sa0_floor; override: force verdict=fake (scores unchanged).")
-    p.add_argument("--sa0_floor", type=float, default=0.65,
-                   help="Score floor for 'floor' mode.")
-    p.add_argument("--sa0_lip_ratio", type=float, default=0.33,
-                   help="Bottom ratio of composite image as lip-strip (mel is the rest).")
     return p.parse_args()
 
 
@@ -280,7 +191,7 @@ def main():
     OUT_PER_IMAGE_CSV = Path(args.per_image_csv) if args.per_image_csv else OUT_DIR / "preds_per_image.csv"
     OUT_PER_SAMPLE_CSV = Path(args.per_sample_csv) if args.per_sample_csv else OUT_DIR / "preds_per_sample.csv"
 
-    # 读取可选的 GT JSON
+    # 读取可选的 GT JSON（注意：键应为前缀后的 sample_id，如 'mix_0'）
     GT_LABELS = {}
     if args.gt_json:
         p = Path(args.gt_json)
@@ -294,23 +205,20 @@ def main():
     print(f"[device] {device} | arch={ARCH}")
     model = build_model(ARCH)
     state = torch.load(CKPT_PATH, map_location="cpu")
-    model.load_state_dict(state.get("model", state))
+    model.load_state_dict(state["model"] if "model" in state else state)
     model.to(device).eval()
     print("[ok] model loaded")
 
-    # 收集全部图片并分组
+    # 收集全部图片并分组（带目录前缀）
     groups = gather_groups(input_dirs)
     if not groups:
         raise RuntimeError(f"未在以下目录中找到合成图：{', '.join(str(d) for d in input_dirs)}")
 
-    # 输出
+    # 准备输出
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     per_img_rows = [("sample_id", "image", "score_fake", "pred(1=fake)", "pred_name", "gt", "correct")]
-    # 追加诊断列：sa0_applied/sa0_reason/sa0_fracs与原始均值方差
     per_smp_rows = [("sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict", "gt",
-                     "sample_acc(%)", "sample_correct",
-                     "sa0_applied", "sa0_reason", "sa0_frac_low", "sa0_frac_mel", "sa0_frac_lip",
-                     "mean_score_raw", "std_score_raw")]
+                     "sample_acc(%)", "sample_correct")]
 
     # 统计
     total_images = 0
@@ -321,58 +229,15 @@ def main():
     # 逐组推理
     for sid, items in sorted(groups.items(), key=lambda kv: kv[0]):
         items_sorted, scores = infer_group(model, device, items, TMP_ROOT, BATCH_SIZE)
-        scores_np_raw = np.array(scores, dtype=float)  # 记录改动前的均值&方差
-        mu_raw = float(scores_np_raw.mean()) if scores_np_raw.size else float("nan")
-        sd_raw = float(scores_np_raw.std()) if scores_np_raw.size else float("nan")
-
-        # —— SA0/ZS：几乎全 0 + (mel/lip/flatline) → 救援
-        sa0_applied = False
-        sa0_reason = ""
-        sa0_frac_low = ""
-        sa0_frac_mel = ""
-        sa0_frac_lip = ""
-        if args.sa0_on:
-            mel_means = np.array([_mel_mean01(it["path"], lip_ratio=args.sa0_lip_ratio) for it in items_sorted],
-                                 dtype=float)
-            lip_mots = np.array([_lip_motion_score(it["path"], lip_ratio=args.sa0_lip_ratio) for it in items_sorted],
-                                dtype=float)
-            trigger, reason, diag = _sa0_decide(
-                np.array(scores, dtype=float), mel_means, lip_mots,
-                eps=args.sa0_eps, min_frac_low=args.sa0_min_frac_low,
-                mel_thresh=args.sa0_mel_thresh, need_mel_frac=args.sa0_need_mel_frac,
-                lip_tau=args.lip_static_tau, need_static_frac=args.need_static_frac,
-                flat_mu=args.flat_mu, flat_sigma=args.flat_sigma
-            )
-            sa0_frac_low = f"{diag['frac_low']:.2f}"
-            sa0_frac_mel = f"{diag['frac_mel']:.2f}"
-            sa0_frac_lip = f"{diag['frac_lip']:.2f}"
-
-            if trigger:
-                sa0_applied = True
-                sa0_reason = reason if reason else "unknown"
-                if args.sa0_mode == "floor":
-                    s = np.maximum(np.array(scores, dtype=float), args.sa0_floor)
-                    scores = s.tolist()
-                    print(
-                        f"[SA0-floor] {sid}: floor={args.sa0_floor} (low≈{diag['frac_low']:.0%}, mel≈{diag['frac_mel']:.0%}, lip≈{diag['frac_lip']:.0%}, mu={diag['mu']:.2e}, sd={diag['sigma']:.2e})")
-                else:  # override
-                    # 不改分数；后面聚合后强制 verdict=fake
-                    for it in items_sorted:
-                        it["_sa0_override"] = True
-                    print(
-                        f"[SA0-override] {sid}: force verdict=fake (low≈{diag['frac_low']:.0%}, mel≈{diag['frac_mel']:.0%}, lip≈{diag['frac_lip']:.0%}, mu={diag['mu']:.2e}, sd={diag['sigma']:.2e})")
-
-        # —— 逐图预测标签
         preds = [1 if s >= THRESH else 0 for s in scores]
         gt = GT_LABELS.get(sid, None)
         print(f"[inferred] sample_id={sid} | num_images={len(items_sorted)} | gt={gt if gt is not None else 'N/A'}")
-
-        # —— 逐图结果行
+        # —— 逐图结果
         for it, s, y in zip(items_sorted, scores, preds):
             pred_name = "fake" if y == 1 else "real"
             total_images += 1
             image_pred_counter[pred_name] += 1
-            img_disp = f"{it['prefix']}/{it['filename']}"
+            img_disp = f"{it['prefix']}/{it['filename']}"  # 显示来源目录
             if gt is None:
                 per_img_rows.append((sid, img_disp, f"{s:.6f}", y, pred_name, "", ""))
             else:
@@ -381,36 +246,26 @@ def main():
 
         # —— 聚合为 sample 结果
         scores_np = np.array(scores, dtype=float)
-        mean_s = float(scores_np.mean()) if scores_np.size else 0.0
-        median_s = float(np.median(scores_np)) if scores_np.size else 0.0
-        vote_fake = 100.0 * (sum(preds) / len(preds)) if preds else 0.0
+        mean_s = float(scores_np.mean())
+        median_s = float(np.median(scores_np))
+        vote_fake = 100.0 * (sum(preds) / len(preds))
         if abs(mean_s - 0.5) <= UNCERT_BAND:
             verdict = "uncertain"
         elif mean_s >= THRESH:
             verdict = "fake"
         else:
             verdict = "real"
-
-        # —— SA0 override: 直接强制 fake
-        if args.sa0_on and args.sa0_mode == "override":
-            if any(("_sa0_override" in it) for it in items_sorted):
-                verdict = "fake"
-
         sample_pred_counter[verdict] += 1
 
         if gt is None:
             per_smp_rows.append((sid, len(items_sorted), f"{mean_s:.6f}", f"{median_s:.6f}",
-                                 f"{vote_fake:.1f}", verdict, "", "", "",
-                                 int(sa0_applied), sa0_reason, sa0_frac_low, sa0_frac_mel, sa0_frac_lip,
-                                 f"{mu_raw:.6e}", f"{sd_raw:.6e}"))
+                                 f"{vote_fake:.1f}", verdict, "", "", ""))
         else:
             per_img_correct = [int(y == int(gt)) for y in preds]
-            smp_acc = 100.0 * (sum(per_img_correct) / len(per_img_correct)) if per_img_correct else 0.0
+            smp_acc = 100.0 * (sum(per_img_correct) / len(per_img_correct))
             sample_correct = int((1 if verdict == "fake" else 0) == int(gt)) if verdict in ("fake", "real") else ""
             per_smp_rows.append((sid, len(items_sorted), f"{mean_s:.6f}", f"{median_s:.6f}",
-                                 f"{vote_fake:.1f}", verdict, int(gt), f"{smp_acc:.1f}", sample_correct,
-                                 int(sa0_applied), sa0_reason, sa0_frac_low, sa0_frac_mel, sa0_frac_lip,
-                                 f"{mu_raw:.6e}", f"{sd_raw:.6e}"))
+                                 f"{vote_fake:.1f}", verdict, int(gt), f"{smp_acc:.1f}", sample_correct))
 
     # —— 导出 CSV
     with open(OUT_PER_IMAGE_CSV, "w", newline="", encoding="utf-8") as f:

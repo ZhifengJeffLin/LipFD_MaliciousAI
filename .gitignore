@@ -7,6 +7,11 @@ __pycache__
 /work/*.json
 /datasets/AVLips
 /datasets/large
+/datasets/pear_video
+/datasets/pear_video_clips
+/datasets/_group_tmp
+/your_video
+/your_video_clips
 /samples/wav
 /samples_clips
 *.zip
