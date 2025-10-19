@@ -9,3 +9,4 @@ __pycache__
 /datasets/large
 /samples/wav
 /samples_clips
+*.zip

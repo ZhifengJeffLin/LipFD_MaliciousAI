@@ -1,0 +1,2 @@
+AUC,EER,thr_at_EER,FPR@EER,FNR@EER,TN,FP,FN,TP,verdict_before,verdict_after
+0.9868,0.04,0.506,0.05,0.03,95,5,3,97,"{'real': 95, 'fake': 80, 'uncertain': 25}","{'real': 81, 'fake': 67, 'uncertain': 52}"
