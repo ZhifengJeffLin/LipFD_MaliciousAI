@@ -262,6 +262,18 @@ def parse_args():
                    help="Score floor for 'floor' mode.")
     p.add_argument("--sa0_lip_ratio", type=float, default=0.33,
                    help="Bottom ratio of composite image as lip-strip (mel is the rest).")
+
+    # --- image-level near-zero flipping ---
+    p.add_argument("--imgnz_on", action="store_true",
+                   help="Turn on image-level near-zero flipping (scores < eps are lifted to floor).")
+    p.add_argument("--imgnz_eps", type=float, default=1e-2,
+                   help="Per-image score < eps is considered near-zero (e.g., 0.01).")
+    p.add_argument("--imgnz_floor", type=float, default=0.70,
+                   help="When near-zero, replace per-image score by this floor (e.g., 0.70).")
+    p.add_argument("--imgnz_min_frac", type=float, default=0.0,
+                   help="Optional: if fraction of near-zero frames >= this, also force sample verdict=fake. "
+                        "Set 0.0 to disable forcing.")
+
     return p.parse_args()
 
 
@@ -322,6 +334,16 @@ def main():
     for sid, items in sorted(groups.items(), key=lambda kv: kv[0]):
         items_sorted, scores = infer_group(model, device, items, TMP_ROOT, BATCH_SIZE)
         scores_np_raw = np.array(scores, dtype=float)  # 记录改动前的均值&方差
+        # --- image-level near-zero flipping (before making preds) ---
+        nz_count = 0
+        if args.imgnz_on and len(scores) > 0:
+            s = np.asarray(scores, dtype=float)
+            nz_mask = s < args.imgnz_eps  # near-zero 判定（0.00x）
+            nz_count = int(nz_mask.sum())
+            if nz_count > 0:
+                s[nz_mask] = np.maximum(s[nz_mask], args.imgnz_floor)  # 抬到地板
+                scores = s.tolist()
+
         mu_raw = float(scores_np_raw.mean()) if scores_np_raw.size else float("nan")
         sd_raw = float(scores_np_raw.std()) if scores_np_raw.size else float("nan")
 
@@ -395,6 +417,12 @@ def main():
         if args.sa0_on and args.sa0_mode == "override":
             if any(("_sa0_override" in it) for it in items_sorted):
                 verdict = "fake"
+
+        # optional: if near-zero 占比达到门槛，直接强制 sample verdict=fake
+        if args.imgnz_on and args.imgnz_min_frac > 0:
+            if nz_count / max(1, len(scores)) >= args.imgnz_min_frac:
+                verdict = "fake"
+
 
         sample_pred_counter[verdict] += 1
 

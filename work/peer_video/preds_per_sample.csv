@@ -1,0 +1,5 @@
+sample_id,num_images,mean_score,median_score,vote_fake(%),verdict,gt,sample_acc(%),sample_correct,sa0_applied,sa0_reason,sa0_frac_low,sa0_frac_mel,sa0_frac_lip,mean_score_raw,std_score_raw
+peer_video_clips_0,20,0.000025,0.000006,0.0,real,,,,0,,,,,2.489235e-05,3.985345e-05
+peer_video_clips_1,20,0.000881,0.000132,0.0,real,,,,0,,,,,8.809826e-04,1.876024e-03
+peer_video_clips_2,20,0.008269,0.000111,0.0,real,,,,0,,,,,8.269157e-03,3.450442e-02
+peer_video_clips_3,20,0.000937,0.000232,0.0,real,,,,0,,,,,9.373309e-04,1.885502e-03

@@ -1,0 +1,5 @@
+sample_id,mean_before,verdict_before,mean_after,verdict_after,delta,verdict_change
+peer_video_clips_0,2.5e-05,real,0.7,fake,0.6999749999999999,True
+peer_video_clips_1,0.000881,real,0.595717,fake,0.594836,True
+peer_video_clips_2,0.008269,real,0.603154,fake,0.594885,True
+peer_video_clips_3,0.000937,real,0.56076,fake,0.5598230000000001,True
