@@ -277,3 +277,203 @@ def parse_args():
     return p.parse_args()
 
 # (main function continues unchanged...)
+def main():
+    args = parse_args()
+
+    input_dirs = parse_input_dirs(args)
+    CKPT_PATH = Path(args.ckpt)
+    ARCH = args.arch
+    GPU_ID = args.gpu
+    TMP_ROOT = Path(args.tmp_root)
+    BATCH_SIZE = args.batch_size
+    THRESH = args.thresh
+    UNCERT_BAND = args.uncert_band
+    OUT_DIR = Path(args.out_dir)
+    OUT_PER_IMAGE_CSV = Path(args.per_image_csv) if args.per_image_csv else OUT_DIR / "preds_per_image.csv"
+    OUT_PER_SAMPLE_CSV = Path(args.per_sample_csv) if args.per_sample_csv else OUT_DIR / "preds_per_sample.csv"
+
+    # 读取可选的 GT JSON
+    GT_LABELS = {}
+    if args.gt_json:
+        p = Path(args.gt_json)
+        if p.exists():
+            GT_LABELS = json.loads(p.read_text(encoding="utf-8"))
+        else:
+            print(f"[warn] gt_json 文件不存在：{p}")
+
+    # 设备 & 模型
+    device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+    print(f"[device] {device} | arch={ARCH}")
+    model = build_model(ARCH)
+    state = torch.load(CKPT_PATH, map_location="cpu")
+    model.load_state_dict(state.get("model", state))
+    model.to(device).eval()
+    print("[ok] model loaded")
+
+    # 收集全部图片并分组
+    groups = gather_groups(input_dirs)
+    if not groups:
+        raise RuntimeError(f"未在以下目录中找到合成图：{', '.join(str(d) for d in input_dirs)}")
+
+    # 输出
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    per_img_rows = [("sample_id", "image", "score_fake", "pred(1=fake)", "pred_name", "gt", "correct")]
+    # 追加诊断列：sa0_applied/sa0_reason/sa0_fracs与原始均值方差
+    per_smp_rows = [("sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict", "gt",
+                     "sample_acc(%)", "sample_correct",
+                     "sa0_applied", "sa0_reason", "sa0_frac_low", "sa0_frac_mel", "sa0_frac_lip",
+                     "mean_score_raw", "std_score_raw")]
+
+    # 统计
+    total_images = 0
+    total_samples = len(groups)
+    sample_pred_counter = Counter()
+    image_pred_counter = Counter()
+
+    # 逐组推理
+    for sid, items in sorted(groups.items(), key=lambda kv: kv[0]):
+        items_sorted, scores = infer_group(model, device, items, TMP_ROOT, BATCH_SIZE)
+        scores_np_raw = np.array(scores, dtype=float)  # 记录改动前的均值&方差
+        # --- image-level near-zero flipping (before making preds) ---
+        nz_count = 0
+        if args.imgnz_on and len(scores) > 0:
+            s = np.asarray(scores, dtype=float)
+            nz_mask = s < args.imgnz_eps  # near-zero 判定（0.00x）
+            nz_count = int(nz_mask.sum())
+            if nz_count > 0:
+                s[nz_mask] = np.maximum(s[nz_mask], args.imgnz_floor)  # 抬到地板
+                scores = s.tolist()
+
+        mu_raw = float(scores_np_raw.mean()) if scores_np_raw.size else float("nan")
+        sd_raw = float(scores_np_raw.std()) if scores_np_raw.size else float("nan")
+
+        # —— SA0/ZS：几乎全 0 + (mel/lip/flatline) → 救援
+        sa0_applied = False
+        sa0_reason = ""
+        sa0_frac_low = ""
+        sa0_frac_mel = ""
+        sa0_frac_lip = ""
+        if args.sa0_on:
+            mel_means = np.array([_mel_mean01(it["path"], lip_ratio=args.sa0_lip_ratio) for it in items_sorted],
+                                 dtype=float)
+            lip_mots = np.array([_lip_motion_score(it["path"], lip_ratio=args.sa0_lip_ratio) for it in items_sorted],
+                                dtype=float)
+            trigger, reason, diag = _sa0_decide(
+                np.array(scores, dtype=float), mel_means, lip_mots,
+                eps=args.sa0_eps, min_frac_low=args.sa0_min_frac_low,
+                mel_thresh=args.sa0_mel_thresh, need_mel_frac=args.sa0_need_mel_frac,
+                lip_tau=args.lip_static_tau, need_static_frac=args.need_static_frac,
+                flat_mu=args.flat_mu, flat_sigma=args.flat_sigma
+            )
+            sa0_frac_low = f"{diag['frac_low']:.2f}"
+            sa0_frac_mel = f"{diag['frac_mel']:.2f}"
+            sa0_frac_lip = f"{diag['frac_lip']:.2f}"
+
+            if trigger:
+                sa0_applied = True
+                sa0_reason = reason if reason else "unknown"
+                if args.sa0_mode == "floor":
+                    s = np.maximum(np.array(scores, dtype=float), args.sa0_floor)
+                    scores = s.tolist()
+                    print(
+                        f"[SA0-floor] {sid}: floor={args.sa0_floor} (low≈{diag['frac_low']:.0%}, mel≈{diag['frac_mel']:.0%}, lip≈{diag['frac_lip']:.0%}, mu={diag['mu']:.2e}, sd={diag['sigma']:.2e})")
+                else:  # override
+                    # 不改分数；后面聚合后强制 verdict=fake
+                    for it in items_sorted:
+                        it["_sa0_override"] = True
+                    print(
+                        f"[SA0-override] {sid}: force verdict=fake (low≈{diag['frac_low']:.0%}, mel≈{diag['frac_mel']:.0%}, lip≈{diag['frac_lip']:.0%}, mu={diag['mu']:.2e}, sd={diag['sigma']:.2e})")
+
+        # —— 逐图预测标签
+        preds = [1 if s >= THRESH else 0 for s in scores]
+        gt = GT_LABELS.get(sid, None)
+        print(f"[inferred] sample_id={sid} | num_images={len(items_sorted)} | gt={gt if gt is not None else 'N/A'}")
+
+        # —— 逐图结果行
+        for it, s, y in zip(items_sorted, scores, preds):
+            pred_name = "fake" if y == 1 else "real"
+            total_images += 1
+            image_pred_counter[pred_name] += 1
+            img_disp = f"{it['prefix']}/{it['filename']}"
+            if gt is None:
+                per_img_rows.append((sid, img_disp, f"{s:.6f}", y, pred_name, "", ""))
+            else:
+                ok = int(y == int(gt))
+                per_img_rows.append((sid, img_disp, f"{s:.6f}", y, pred_name, int(gt), ok))
+
+        # —— 聚合为 sample 结果
+        scores_np = np.array(scores, dtype=float)
+        mean_s = float(scores_np.mean()) if scores_np.size else 0.0
+        median_s = float(np.median(scores_np)) if scores_np.size else 0.0
+        vote_fake = 100.0 * (sum(preds) / len(preds)) if preds else 0.0
+        if abs(mean_s - 0.5) <= UNCERT_BAND:
+            verdict = "uncertain"
+        elif mean_s >= THRESH:
+            verdict = "fake"
+        else:
+            verdict = "real"
+
+        # —— SA0 override: 直接强制 fake
+        if args.sa0_on and args.sa0_mode == "override":
+            if any(("_sa0_override" in it) for it in items_sorted):
+                verdict = "fake"
+
+        # optional: if near-zero 占比达到门槛，直接强制 sample verdict=fake
+        if args.imgnz_on and args.imgnz_min_frac > 0:
+            if nz_count / max(1, len(scores)) >= args.imgnz_min_frac:
+                verdict = "fake"
+
+        sample_pred_counter[verdict] += 1
+
+        if gt is None:
+            per_smp_rows.append((sid, len(items_sorted), f"{mean_s:.6f}", f"{median_s:.6f}",
+                                 f"{vote_fake:.1f}", verdict, "", "", "",
+                                 int(sa0_applied), sa0_reason, sa0_frac_low, sa0_frac_mel, sa0_frac_lip,
+                                 f"{mu_raw:.6e}", f"{sd_raw:.6e}"))
+        else:
+            per_img_correct = [int(y == int(gt)) for y in preds]
+            smp_acc = 100.0 * (sum(per_img_correct) / len(per_img_correct)) if per_img_correct else 0.0
+            sample_correct = int((1 if verdict == "fake" else 0) == int(gt)) if verdict in ("fake", "real") else ""
+            per_smp_rows.append((sid, len(items_sorted), f"{mean_s:.6f}", f"{median_s:.6f}",
+                                 f"{vote_fake:.1f}", verdict, int(gt), f"{smp_acc:.1f}", sample_correct,
+                                 int(sa0_applied), sa0_reason, sa0_frac_low, sa0_frac_mel, sa0_frac_lip,
+                                 f"{mu_raw:.6e}", f"{sd_raw:.6e}"))
+
+    # —— 导出 CSV
+    with open(OUT_PER_IMAGE_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(per_img_rows)
+    with open(OUT_PER_SAMPLE_CSV, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(per_smp_rows)
+
+    # —— 终端打印（简表 + 总结）
+    print("\n【逐样本聚合结果】")
+    headers_s = ["sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict"]
+    rows_s = [[r[0], r[1], r[2], r[3], r[4], r[5]] for r in per_smp_rows[1:]]
+    print_table(headers_s, rows_s)
+
+    print("\n【逐图结果（前 %d 条预览）】" % args.preview_n)
+    headers_i = ["sample_id", "image", "score_fake", "pred"]
+    preview = [[r[0], r[1], r[2], r[4]] for r in per_img_rows[1:1 + args.preview_n]]
+    print_table(headers_i, preview)
+
+    print("\n【全部预测汇总】")
+    total_fake_samples = sample_pred_counter["fake"]
+    total_real_samples = sample_pred_counter["real"]
+    total_uncertain_samples = sample_pred_counter["uncertain"]
+    total = total_samples
+    rows_summary = [
+        ["total_samples", total],
+        ["fake_samples", f"{total_fake_samples} ({(total_fake_samples / total):.1%})" if total else "0"],
+        ["real_samples", f"{total_real_samples} ({(total_real_samples / total):.1%})" if total else "0"],
+        ["uncertain_samples", f"{total_uncertain_samples} ({(total_uncertain_samples / total):.1%})" if total else "0"],
+        ["total_images", total_images],
+        ["image_preds", f"fake={image_pred_counter['fake']}, real={image_pred_counter['real']}"],
+    ]
+    print_table(["metric", "value"], rows_summary)
+
+    print("saved ->", OUT_PER_IMAGE_CSV.as_posix())
+    print("saved ->", OUT_PER_SAMPLE_CSV.as_posix())
+
+
+if __name__ == "__main__":
+    main()
