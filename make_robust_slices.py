@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# 用法（本地跑）：python make_robust_slices.py --src_slices ./datasets/val --dst_root ./work/robust_slices --qualities 80 60 40
-# 说明：对 ./datasets/val/{0_real,1_fake} 下的 PNG/JPG 切片做 JPEG round-trip（Q=80/60/40），
-#       生成 ./work/robust_slices/q80|q60|q40/{0_real,1_fake}/*.png
+# Usage (run locally): python make_robust_slices.py --src_slices ./datasets/val --dst_root ./work/robust_slices --qualities 80 60 40
+# Description: Perform JPEG round-trip (Q=80/60/40) on PNG/JPG slices under ./datasets/val/{0_real,1_fake},
+#              and generate ./work/robust_slices/q80|q60|q40/{0_real,1_fake}/*.png
+
 
 import argparse
 import glob

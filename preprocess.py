@@ -7,9 +7,9 @@ from tqdm import tqdm
 
 """
 Flattened mode:
-- video_root: 直接是视频所在的目录（不再要求 0_real / 1_fake 子目录）
-- audio_root: 默认 = <video_root>/../wav/<basename(video_root)>
-- output_root: 切片图片直接输出在这里
+- video_root: directory that directly contains videos (no longer requires 0_real / 1_fake subfolders)
+- audio_root: defaults to <video_root>/../wav/<basename(video_root)>
+- output_root: sliced images will be directly saved here
 """
 
 # =================== Config: paths + custom params ===================
@@ -20,34 +20,34 @@ import argparse, os, subprocess, shutil, re
 def _resolve_config():
     p = argparse.ArgumentParser(add_help=False)
 
-    # 基础路径
+    # Basic paths
     p.add_argument('--root', type=str, default=None,
-                   help='工程根目录；不传则使用脚本所在目录')
+                   help='Project root directory; defaults to the script directory')
     p.add_argument('--video_root', type=str, default=None,
-                   help='视频目录（直接放视频文件，无需 0_real/1_fake 子目录），默认 <root>/AVLips')
+                   help='Directory containing videos (no need for 0_real/1_fake subfolders), default: <root>/AVLips')
     p.add_argument('--audio_root', type=str, default=None,
-                   help='音频目录；不传则自动设为 <video_root>/../wav/<basename(video_root)>')
+                   help='Audio directory; defaults to <video_root>/../wav/<basename(video_root)>')
     p.add_argument('--output_root', type=str, default=None,
-                   help='输出目录（切片图片直接写到这里），默认 <root>/datasets/AVLips')
+                   help='Output directory (sliced images will be saved directly here), default: <root>/datasets/AVLips')
 
-    # 自定义
-    p.add_argument('--n_extract', type=int, default=10, help='number of extracted images from video')
-    p.add_argument('--window_len', type=int, default=5, help='frames of each window')
-    p.add_argument('--max_sample', type=int, default=100, help='max number of videos to process')
+    # Custom parameters
+    p.add_argument('--n_extract', type=int, default=10, help='number of extracted images from each video')
+    p.add_argument('--window_len', type=int, default=5, help='number of frames in each window')
+    p.add_argument('--max_sample', type=int, default=100, help='maximum number of videos to process')
 
-    # 缺少 wav 时是否自动抽取音轨
+    # Auto-extraction of wav files when missing
     p.add_argument('--auto_extract_wav', action='store_true',
-                   help='若找不到同名wav，自动用ffmpeg从视频中抽取音轨(单声道,16kHz)')
+                   help='If a matching wav file is missing, automatically extract audio from video via ffmpeg (mono, 16kHz)')
 
     args, _ = p.parse_known_args()
 
-    # 基准根目录（默认=脚本目录）
+    # Base root directory (default = script directory)
     script_dir = Path(__file__).resolve().parent
     root = Path(args.root).resolve() if args.root else script_dir
 
-    # 具体路径（若未传参则使用默认）
+    # Paths (use defaults if not provided)
     video = Path(args.video_root).resolve() if args.video_root else (root / 'AVLips')
-    # 关键：audio_root 默认跟随 video_root
+    # audio_root follows video_root by default
     if args.audio_root:
         audio = Path(args.audio_root).resolve()
     else:
@@ -55,11 +55,11 @@ def _resolve_config():
 
     output = Path(args.output_root).resolve() if args.output_root else (root / 'datasets' / 'AVLips')
 
-    # 创建输出目录
+    # Ensure directories exist
     output.mkdir(parents=True, exist_ok=True)
     audio.mkdir(parents=True, exist_ok=True)
 
-    # 健壮性检查
+    # Validation
     if args.n_extract <= 0:  raise ValueError('--n_extract must be > 0')
     if args.window_len <= 0: raise ValueError('--window_len must be > 0')
     if args.max_sample <= 0: raise ValueError('--max_sample must be > 0')
@@ -78,7 +78,7 @@ def _resolve_config():
 
 _cfg = _resolve_config()
 
-# 推荐使用的大写常量
+# Recommended uppercase constants
 AUDIO_ROOT = _cfg['AUDIO_ROOT']
 VIDEO_ROOT = _cfg['VIDEO_ROOT']
 OUTPUT_ROOT = _cfg['OUTPUT_ROOT']
@@ -88,7 +88,7 @@ MAX_SAMPLE = _cfg['MAX_SAMPLE']
 SCRIPT_DIR = _cfg['SCRIPT_DIR']
 AUTO_EXTRACT_WAV = _cfg['AUTO_EXTRACT_WAV']
 
-# 兼容你原来的小写变量
+# Backward compatibility with lowercase variables
 audio_root = AUDIO_ROOT
 video_root = VIDEO_ROOT
 output_root = OUTPUT_ROOT
@@ -113,7 +113,7 @@ def _ffmpeg_bin() -> str:
 
 
 def ffmpeg_extract_wav(video_path: Path, wav_path: Path, sr: int = 16000) -> bool:
-    """从视频抽音轨到 wav（单声道，16kHz）。失败时打印 stderr。"""
+    """Extract audio from video into wav (mono, 16kHz). Print stderr on failure."""
     wav_path = Path(wav_path)
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [_ffmpeg_bin(), '-y', '-i', str(video_path), '-vn', '-ac', '1', '-ar', str(sr), str(wav_path)]
@@ -121,7 +121,7 @@ def ffmpeg_extract_wav(video_path: Path, wav_path: Path, sr: int = 16000) -> boo
         ret = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if ret.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size <= 44:
             print("[ffmpeg stderr]")
-            print(ret.stderr.strip()[:2000])  # 关键报错（截断）
+            print(ret.stderr.strip()[:2000])  # Truncated error message
             return False
         return True
     except FileNotFoundError:
@@ -133,16 +133,16 @@ def ffmpeg_extract_wav(video_path: Path, wav_path: Path, sr: int = 16000) -> boo
 
 
 def _is_numeric_stem(stem: str) -> bool:
-    # 仅纯数字视为“已规范”
+    # Only pure numeric names are treated as “already normalized”
     return bool(re.fullmatch(r'\d+', stem))
 
 
 def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
     """
-    将 video_dir 下的所有视频文件重命名为数字序列（从 0 起、跳过已占用的数字）。
-    - 已经是纯数字名的文件不改名（[keep]）
-    - 非数字名的按序改名（[rename] old -> new）
-    - 若 audio_dir 下有与旧名同 stem 的 wav，则尝试同步改名（冲突时跳过并提示）
+    Rename all video files under video_dir to numeric sequences (starting from 0, skipping used numbers).
+    - Pure numeric names are kept unchanged ([keep])
+    - Non-numeric names are renamed sequentially ([rename] old -> new)
+    - If audio_dir contains wav files matching old stems, they will be renamed accordingly (with conflict checks)
     """
     exts = {'.mp4', '.mov', '.mkv', '.avi', '.mpg', '.mpeg', '.m4v', '.webm'}
     files = [p for p in sorted(video_dir.iterdir()) if p.is_file() and p.suffix.lower() in exts]
@@ -150,7 +150,6 @@ def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
         print(f"[normalize] no video files in: {video_dir}")
         return
 
-    # 已占用数字集合（来自已是数字名的视频）
     used = set()
     for p in files:
         if _is_numeric_stem(p.stem):
@@ -171,13 +170,11 @@ def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
             kept += 1
             continue
 
-        # 找下一个未占用的整数 ID
         while next_id in used:
             next_id += 1
         new_name = f"{next_id}{p.suffix.lower()}"
         dst = p.with_name(new_name)
 
-        # 若目标已存在（极少见，通常因为别的文件名刚好抢占了该 ID），则继续找空位
         while dst.exists():
             next_id += 1
             while next_id in used:
@@ -185,13 +182,11 @@ def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
             new_name = f"{next_id}{p.suffix.lower()}"
             dst = p.with_name(new_name)
 
-        # 执行视频重命名
         p.rename(dst)
         print(f"[rename] {p.name} -> {dst.name}")
         used.add(next_id)
         renamed += 1
 
-        # 同步重命名已有 wav（若存在）
         old_wav = audio_dir / f"{stem}.wav"
         new_wav = audio_dir / f"{next_id}.wav"
         if old_wav.exists():
@@ -210,7 +205,7 @@ def normalize_video_filenames(video_dir: Path, audio_dir: Path) -> None:
 
 
 def run():
-    # —— 若启用自动抽取，则在开始前清空目标 audio_root（防止残留对齐不上）
+    # If auto extraction is enabled, clear audio_root before starting to prevent misalignment
     if AUTO_EXTRACT_WAV:
         try:
             if Path(audio_root).resolve() == Path(video_root).resolve():
@@ -224,10 +219,10 @@ def run():
         except Exception as e:
             print(f"[warn] failed to clean audio_root: {e}")
 
-    # 0) 先把视频文件名规范化为数字
+    # 0) Normalize filenames to numeric IDs
     normalize_video_filenames(Path(video_root), Path(audio_root))
 
-    # 1) 枚举 video_root 下的视频（不再分子目录）
+    # 1) Enumerate videos (no subdirectories)
     exts = {'.mp4', '.mov', '.mkv', '.avi', '.mpg', '.mpeg', '.m4v', '.webm'}
     all_videos = [p for p in sorted(Path(video_root).iterdir())
                   if p.is_file() and p.suffix.lower() in exts]
@@ -240,7 +235,7 @@ def run():
     print(f"Handling videos in: {video_root} (count={len(all_videos)})")
 
     for vpath in tqdm(all_videos):
-        # === 读取视频帧 ===
+        # === Read video frames ===
         video_capture = cv2.VideoCapture(str(vpath))
         frame_count = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -259,7 +254,7 @@ def run():
         while frame_sequence and current_frame <= frame_sequence[-1]:
             ret, frame = video_capture.read()
             if not ret:
-                print(f"[warn] read frame fail: {vpath} @ {current_frame}")
+                print(f"[warn] failed to read frame: {vpath} @ {current_frame}")
                 break
             if current_frame in frame_sequence:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
@@ -271,8 +266,8 @@ def run():
             print(f"[warn] no frames extracted: {vpath}")
             continue
 
-        # 2) 音频：默认放在 <video_root>/../wav/<basename(video_root)>/<name>.wav
-        name = vpath.stem  # 现在已经是数字字符串
+        # 2) Audio: default path <video_root>/../wav/<basename(video_root)>/<name>.wav
+        name = vpath.stem  # already numeric
         wav_file = Path(audio_root) / f"{name}.wav"
 
         if not wav_file.exists():
@@ -287,7 +282,7 @@ def run():
                 print(f"[skip] missing wav: {wav_file} (use --auto_extract_wav to enable auto-extraction)")
                 continue
 
-        # 3) 生成谱图 + 拼接 + 保存到 output_root
+        # 3) Generate spectrogram + concatenate + save to output_root
         get_spectrogram(str(wav_file))
         mel = plt.imread("./temp/mel.png") * 255
         mel = mel.astype(np.uint8)
@@ -308,7 +303,7 @@ def run():
                     plt.imsave(out_png.as_posix(), x)
                     group += 1
                 except Exception as e:
-                    print(f"[warn] save slice fail: {name}_{group}.png ({e})")
+                    print(f"[warn] failed to save slice: {name}_{group}.png ({e})")
                     continue
 
     print("[done] preprocess finished.")

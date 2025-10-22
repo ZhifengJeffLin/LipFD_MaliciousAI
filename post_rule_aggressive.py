@@ -2,27 +2,30 @@
 # -*- coding: utf-8 -*-
 """
 post_rule_aggressive.py
-对 predict 的输出做规则“加成”（更容易判 fake），不改动模型本体。
+Apply rule-based post-processing to prediction outputs (to make fake detection more aggressive)
+without modifying the model itself.
 
-输入：
-  --preds_per_image   work/xxx/preds_per_image.csv（必需，含 sample_id,image,score_fake）
-  --preds_per_sample  work/xxx/preds_per_sample.csv（可选，用来对齐已有 mean_score / verdict）
-  --slices_root       复合图所在根目录（image 列通常是相对路径，如 1_fake/0_3.png）
-  --out_dir           输出目录（默认：同级 out_dir_ruleboost）
-  --num_tiles         唇条带水平帧数（默认 10；与你的预处理一致即可）
-  --tau_low_motion    低运动阈值（默认 0.03；越小越严格）
-  --tau_av_corr       音画相关性阈值（默认 0.20；低于此认为不同步）
-  --boost_low_motion  命中低运动时加分（默认 0.07）
-  --boost_av_mismatch 命中不同步时加分（默认 0.07）
-  --boost_cap         每个 sample 的最大总加分（默认 0.15）
-  --thresh            重新出 verdict 时的阈值（默认 0.50；你也可用前面算到的 thr_at_EER）
-说明：
-  - 脚本会读取每个 sample 的若干复合图（默认全读；你也可以在代码里把 k_images 调小）。
-  - 对每张复合图：自动找“Mel/唇条带”的分界行；把唇条带均分成 num_tiles 份估计相邻差分；
-    Mel 取列均值作为时间能量，和唇相邻差分做简单相关性。
-  - 规则命中会对该 sample 的 mean_score 加小幅度；最后写出新的 per-sample CSV。
+Inputs:
+  --preds_per_image   work/xxx/preds_per_image.csv (required; must include sample_id, image, score_fake)
+  --preds_per_sample  work/xxx/preds_per_sample.csv (optional; used to align existing mean_score / verdict)
+  --slices_root       Root directory of composite images (the 'image' column is usually a relative path, e.g., 1_fake/0_3.png)
+  --out_dir           Output directory (default: sibling directory named out_dir_ruleboost)
+  --num_tiles         Number of horizontal lip tiles (default: 10; should match your preprocessing)
+  --tau_low_motion    Low-motion threshold (default: 0.03; smaller = stricter)
+  --tau_av_corr       Audio-visual correlation threshold (default: 0.20; below this = desynchronized)
+  --boost_low_motion  Boost amount when low-motion condition is met (default: 0.07)
+  --boost_av_mismatch Boost amount when AV-mismatch condition is met (default: 0.07)
+  --boost_cap         Maximum total boost per sample (default: 0.15)
+  --thresh            Threshold for re-evaluating verdicts (default: 0.50; can use previous thr_at_EER)
 
-用法示例：
+Description:
+  - The script reads several composite images for each sample (by default all; you can reduce k_images manually).
+  - For each composite image: it automatically finds the Mel/lip-strip boundary,
+    divides the lip-strip into num_tiles segments, and computes temporal differences between adjacent tiles.
+    Mel spectrograms are column-averaged to estimate temporal energy, then correlated with lip motion.
+  - Rule triggers add a small bonus to mean_score per sample, producing a new per-sample CSV.
+
+Example usage:
   python post_rule_aggressive.py \
     --preds_per_image ./work/other_team/preds_per_image.csv \
     --preds_per_sample ./work/other_team/preds_per_sample.csv \
@@ -32,11 +35,11 @@ post_rule_aggressive.py
 """
 
 import argparse
-import numpy as np
-import pandas as pd
 import re
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 from PIL import Image
 
 
@@ -54,11 +57,11 @@ def as_np01(png_path: Path):
 
 
 def find_boundary_row(img: np.ndarray):
-    # 在高度维做行间梯度，找到 Mel/唇分界；失败则取 60% 处
+    # Compute vertical gradients to find the Mel/lip boundary; fallback = 60% height
     g = np.abs(np.diff(img, axis=0)).mean(axis=(1, 2))
     if g.size < 3: return int(img.shape[0] * 0.6)
     r = int(np.argmax(g))
-    # 限制在 [30%, 80%] 区间，避免异常
+    # Constrain to [30%, 80%] range to avoid outliers
     r = int(np.clip(r, int(0.3 * img.shape[0]), int(0.8 * img.shape[0])))
     return r
 
@@ -72,18 +75,18 @@ def split_tiles(lip_strip: np.ndarray, n: int):
 
 def lip_motion_seq(lip_strip: np.ndarray, n_tiles: int):
     tiles = split_tiles(lip_strip, n_tiles)
-    # 相邻帧的平均绝对差
+    # Average absolute difference between consecutive frames
     diffs = []
     for i in range(1, len(tiles)):
-        a = tiles[i - 1];
+        a = tiles[i - 1]
         b = tiles[i]
         m = np.mean(np.abs(a - b))
         diffs.append(m)
-    return np.array(diffs, dtype=np.float32)  # 长度 n_tiles-1
+    return np.array(diffs, dtype=np.float32)  # length n_tiles-1
 
 
 def mel_energy_seq(mel: np.ndarray, out_len: int):
-    # 每列取均值作为时间能量，再线性重采样到 out_len
+    # Take column mean as temporal energy, then linearly resample to out_len
     v = mel.mean(axis=0)  # (W,)
     if v.size <= 1:
         return np.zeros(out_len, dtype=np.float32)
@@ -124,22 +127,22 @@ def main():
     need = {"sample_id", "image", "score_fake"}
     assert need.issubset(pi.columns), f"{args.preds_per_image} must contain {need}"
 
-    # 读已有 per-sample（可选）
+    # Read existing per-sample file (optional)
     if args.preds_per_sample and Path(args.preds_per_sample).exists():
         ps = pd.read_csv(args.preds_per_sample)
         base_cols = ["sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict"]
         base = ps[base_cols].copy() if set(base_cols).issubset(ps.columns) else ps[["sample_id", "mean_score"]].copy()
     else:
-        # 只按 per-image 聚合出 mean_score
+        # Aggregate mean_score from per-image predictions
         g = pi.groupby("sample_id")["score_fake"].mean().reset_index()
         g = g.rename(columns={"score_fake": "mean_score"})
         base = g
 
-    # 逐 sample 计算启发式特征
+    # Compute heuristic features per sample
     logs = []
     boosts = {}
     for sid, g in pi.groupby("sample_id"):
-        # 为了快，最多取 4 张合成图估计（可改）
+        # For speed, use at most 4 composite images (modifiable)
         subset = g.head(4)
         low_motions = []
         av_corrs = []
@@ -153,11 +156,11 @@ def main():
             mel = img[:r, :, :]
             lip = img[r:, :, :]
 
-            # 低运动
+            # Low motion
             lm_seq = lip_motion_seq(lip, args.num_tiles)
             low_motions.append(float(lm_seq.mean() if lm_seq.size else 0.0))
 
-            # 音画相关（把 mel 能量重采样到 len(lm_seq)）
+            # Audio-visual correlation (resample Mel energy to match motion length)
             me_seq = mel_energy_seq(mel, max(1, lm_seq.size))
             av_corrs.append(corr01(me_seq, lm_seq) if lm_seq.size else 0.0)
 
@@ -183,14 +186,14 @@ def main():
     log_df = pd.DataFrame(logs).sort_values("sample_id")
     log_df.to_csv(out_dir / "ruleboost_log.csv", index=False)
 
-    # 应用加分
+    # Apply boost
     base["boost"] = base["sample_id"].map(lambda s: boosts.get(s, 0.0))
     base["mean_score_rule"] = np.clip(base["mean_score"].astype(float) + base["boost"].astype(float), 0.0, 1.0)
-    # 重新出 verdict
+    # Recalculate verdict
     base["verdict_rule"] = np.where(base["mean_score_rule"] >= args.thresh, "fake", "real")
     base.to_csv(out_dir / "preds_per_sample_ruleboost.csv", index=False)
 
-    # 小统计
+    # Summary stats
     n = len(base)
     n_boost = int((base["boost"] > 0).sum())
     print(f"[ruleboost] samples={n}, boosted={n_boost} ({n_boost / max(1, n):.1%}), "
@@ -198,10 +201,10 @@ def main():
     print(f"[saved] {out_dir / 'ruleboost_log.csv'}")
     print(f"[saved] {out_dir / 'preds_per_sample_ruleboost.csv'}")
 
-    # 生成一个小图（前后 verdict 分布）
+    # Generate small visualization (before/after verdict distribution)
     try:
         import matplotlib.pyplot as plt
-        # 如果有旧 verdict 就对比，没有就只画 rule verdict
+        # If previous verdicts exist, compare; otherwise only show rule verdicts
         if "verdict" in base.columns:
             import collections
             def cnt(s):
@@ -214,12 +217,12 @@ def main():
             plt.figure(figsize=(5.6, 3.4))
             plt.bar(X - 0.18, [left.get(k, 0) for k in keys], width=0.36, label="Before")
             plt.bar(X + 0.18, [right.get(k, 0) for k in keys], width=0.36, label="After (rule)")
-            plt.xticks(X, keys);
-            plt.ylabel("# clips");
+            plt.xticks(X, keys)
+            plt.ylabel("# clips")
             plt.title("Verdict change by rule boost")
-            plt.legend();
+            plt.legend()
             plt.tight_layout()
-            plt.savefig(out_dir / "verdict_change.png", dpi=160, bbox_inches="tight");
+            plt.savefig(out_dir / "verdict_change.png", dpi=160, bbox_inches="tight")
             plt.close()
             print(f"[saved] {out_dir / 'verdict_change.png'}")
     except Exception as e:

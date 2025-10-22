@@ -1,5 +1,7 @@
 # tools/predict_grouped_images.py
-# 多目录输入的“合成图”逐图判别，并按 sample_id（文件名下划线前缀）+ 目录前缀聚合。
+# Perform per-image prediction from multiple input directories of "composite images",
+# and aggregate results by sample_id (the prefix before underscore in filename) + directory prefix.
+
 import argparse
 import csv
 import json
@@ -12,9 +14,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# ---------- 默认参数（不传命令行时就用这些） ----------
+# ---------- Default parameters (used when not specified in the command line) ----------
 DEFAULTS = dict(
-    input_dir="./datasets/AVLips/0_real",  # 兼容：单目录
+    input_dir="./datasets/AVLips/0_real",  # Fallback: single directory
     ckpt="./checkpoints/ckpt.pth",
     arch="CLIP:ViT-L/14",
     gpu=0,
@@ -30,12 +32,13 @@ DEFAULTS = dict(
 )
 # -----------------------------------------------------
 
-# 复用仓库的数据集与模型
+# Reuse dataset and model from the repository
 from data import AVLip
 from models import build_model
 
 
 def list_images(folder: Path):
+    """List all image files in the folder."""
     exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
     files = []
     for e in exts:
@@ -44,13 +47,13 @@ def list_images(folder: Path):
 
 
 def sample_key_from_name(name: str) -> str:
-    """取下划线前缀作为 sample_id，如 '0_9.png' -> '0'，'100_4.png' -> '100'。"""
+    """Extract the prefix before underscore as sample_id, e.g., '0_9.png' -> '0', '100_4.png' -> '100'."""
     m = re.match(r'^([^_]+)_', name)
-    return m.group(1) if m else name  # 若无下划线则用整名
+    return m.group(1) if m else name  # Use full name if no underscore found
 
 
 def parse_input_dirs(args) -> list[Path]:
-    """支持 --input_dirs 多个目录，或逗号分隔；没传则退回 --input_dir。"""
+    """Support multiple --input_dirs (space or comma-separated). If not provided, fallback to --input_dir."""
     dirs = []
     if getattr(args, "input_dirs", None):
         for token in args.input_dirs:
@@ -60,41 +63,41 @@ def parse_input_dirs(args) -> list[Path]:
     paths = [Path(d).resolve() for d in dirs]
     for p in paths:
         if not p.exists():
-            raise FileNotFoundError(f"输入目录不存在: {p}")
+            raise FileNotFoundError(f"Input directory does not exist: {p}")
     return paths
 
 
 def gather_groups(input_dirs: list[Path]):
     """
-    收集图片并按 {prefix}_{sample_id} 分组。
-    返回: dict[group_key] = [item,...]，
-    其中 item = {path, prefix, filename, dst_name, sample_key}
+    Collect images and group them by {prefix}_{sample_id}.
+    Returns: dict[group_key] = [item, ...],
+    where item = {path, prefix, filename, dst_name, sample_key}.
     """
     groups = defaultdict(list)
     for d in input_dirs:
-        prefix = d.name  # 最后一级目录名作为前缀
+        prefix = d.name  # Use the last directory name as prefix
         for p in list_images(d):
             filename = p.name
             sid = sample_key_from_name(filename)
-            sample_key = f"{prefix}_{sid}"  # 显示与聚合用
-            dst_name = f"{prefix}__{filename}"  # 临时目录里避免同名冲突
+            sample_key = f"{prefix}_{sid}"  # for aggregation and display
+            dst_name = f"{prefix}__{filename}"  # avoid filename collisions in tmp folder
             groups[sample_key].append({
                 "path": p, "prefix": prefix, "filename": filename,
                 "dst_name": dst_name, "sample_key": sample_key
             })
-    # 组内按文件名排序
+    # Sort within group by filename
     for k in list(groups.keys()):
         groups[k] = sorted(groups[k], key=lambda it: it["filename"])
     return groups
 
 
 def prepare_tmp_group(items, tmp_root: Path):
-    """把一组图复制到 real/gen，交给 AVLip 解析（使用带前缀的 dst_name 防止重名）。"""
+    """Copy one group of images into 'real' and 'gen' folders for AVLip to read (use dst_name to prevent duplication)."""
     if tmp_root.exists():
         shutil.rmtree(tmp_root, ignore_errors=True)
     (tmp_root / "real").mkdir(parents=True, exist_ok=True)
     (tmp_root / "gen").mkdir(parents=True, exist_ok=True)
-    # 为了和数据集读取顺序对齐，按 dst_name 排序后复制
+    # To match dataset reading order, sort by dst_name before copying
     items_sorted = sorted(items, key=lambda it: it["dst_name"])
     for it in items_sorted:
         shutil.copyfile(it["path"], tmp_root / "real" / it["dst_name"])
@@ -105,8 +108,8 @@ def prepare_tmp_group(items, tmp_root: Path):
 @torch.no_grad()
 def infer_group(model, device, items, tmp_root: Path, batch_size=8):
     """
-    对一组图做一次批量推理。
-    返回: (items_sorted, scores) 保证 scores 与 items_sorted 一一对应。
+    Perform batch inference for one group of images.
+    Returns: (items_sorted, scores) ensuring alignment between images and scores.
     """
     items_sorted, real_dir, fake_dir = prepare_tmp_group(items, tmp_root)
 
@@ -122,7 +125,8 @@ def infer_group(model, device, items, tmp_root: Path, batch_size=8):
 
     dataset = AVLip(opt)
     if len(dataset) == 0:
-        raise RuntimeError("AVLip 数据集为空：请确认这些图是官方 preprocess 生成的‘合成图’。")
+        raise RuntimeError(
+            "AVLip dataset is empty. Please ensure the images are valid 'composite images' from official preprocessing.")
     loader = DataLoader(dataset, batch_size=min(batch_size, len(items_sorted)),
                         shuffle=False, num_workers=0)
 
@@ -137,7 +141,7 @@ def infer_group(model, device, items, tmp_root: Path, batch_size=8):
 
 
 def print_table(headers, rows, col_w=None):
-    """简单表格打印（不引第三方包）"""
+    """Lightweight table printer (no third-party dependency)."""
     if col_w is None:
         col_w = [max(len(str(h)), *(len(str(r[i])) for r in rows)) + 2 for i, h in enumerate(headers)]
     line = '+' + '+'.join('-' * w for w in col_w) + '+'
@@ -155,10 +159,10 @@ def print_table(headers, rows, col_w=None):
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # 新增：多目录
+    # New: support multiple directories
     p.add_argument("--input_dirs", type=str, nargs="*", default=None,
-                   help="可传多个目录或逗号分隔。若未提供，则使用 --input_dir。")
-    # 兼容：单目录
+                   help="Accept multiple directories (space/comma-separated). If not provided, fallback to --input_dir.")
+    # Compatible: single directory
     p.add_argument("--input_dir", type=str, default=DEFAULTS["input_dir"])
     p.add_argument("--ckpt", type=str, default=DEFAULTS["ckpt"])
     p.add_argument("--arch", type=str, default=DEFAULTS["arch"])
@@ -171,7 +175,7 @@ def parse_args():
     p.add_argument("--per_image_csv", type=str, default=DEFAULTS["per_image_csv"])
     p.add_argument("--per_sample_csv", type=str, default=DEFAULTS["per_sample_csv"])
     p.add_argument("--gt_json", type=str, default=DEFAULTS["gt_json"],
-                   help="可选：JSON 文件路径，内容为 {'sample_id': 0/1, ...}；sample_id 需使用前缀格式（如 mix_0）")
+                   help="Optional: JSON path like {'sample_id': 0/1, ...}; sample_id must use prefix format (e.g., mix_0).")
     p.add_argument("--preview_n", type=int, default=DEFAULTS["preview_n"])
     return p.parse_args()
 
@@ -191,16 +195,16 @@ def main():
     OUT_PER_IMAGE_CSV = Path(args.per_image_csv) if args.per_image_csv else OUT_DIR / "preds_per_image.csv"
     OUT_PER_SAMPLE_CSV = Path(args.per_sample_csv) if args.per_sample_csv else OUT_DIR / "preds_per_sample.csv"
 
-    # 读取可选的 GT JSON（注意：键应为前缀后的 sample_id，如 'mix_0'）
+    # Load optional GT JSON (keys should be prefix-style sample_ids like 'mix_0')
     GT_LABELS = {}
     if args.gt_json:
         p = Path(args.gt_json)
         if p.exists():
             GT_LABELS = json.loads(p.read_text(encoding="utf-8"))
         else:
-            print(f"[warn] gt_json 文件不存在：{p}")
+            print(f"[warn] gt_json file not found: {p}")
 
-    # 设备 & 模型
+    # Device & model
     device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device} | arch={ARCH}")
     model = build_model(ARCH)
@@ -209,42 +213,42 @@ def main():
     model.to(device).eval()
     print("[ok] model loaded")
 
-    # 收集全部图片并分组（带目录前缀）
+    # Gather all images and group them (with directory prefix)
     groups = gather_groups(input_dirs)
     if not groups:
-        raise RuntimeError(f"未在以下目录中找到合成图：{', '.join(str(d) for d in input_dirs)}")
+        raise RuntimeError(f"No composite images found in: {', '.join(str(d) for d in input_dirs)}")
 
-    # 准备输出
+    # Prepare output
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     per_img_rows = [("sample_id", "image", "score_fake", "pred(1=fake)", "pred_name", "gt", "correct")]
     per_smp_rows = [("sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict", "gt",
                      "sample_acc(%)", "sample_correct")]
 
-    # 统计
+    # Statistics
     total_images = 0
     total_samples = len(groups)
     sample_pred_counter = Counter()
     image_pred_counter = Counter()
 
-    # 逐组推理
+    # Inference per group
     for sid, items in sorted(groups.items(), key=lambda kv: kv[0]):
         items_sorted, scores = infer_group(model, device, items, TMP_ROOT, BATCH_SIZE)
         preds = [1 if s >= THRESH else 0 for s in scores]
         gt = GT_LABELS.get(sid, None)
         print(f"[inferred] sample_id={sid} | num_images={len(items_sorted)} | gt={gt if gt is not None else 'N/A'}")
-        # —— 逐图结果
+        # Per-image results
         for it, s, y in zip(items_sorted, scores, preds):
             pred_name = "fake" if y == 1 else "real"
             total_images += 1
             image_pred_counter[pred_name] += 1
-            img_disp = f"{it['prefix']}/{it['filename']}"  # 显示来源目录
+            img_disp = f"{it['prefix']}/{it['filename']}"  # show source directory
             if gt is None:
                 per_img_rows.append((sid, img_disp, f"{s:.6f}", y, pred_name, "", ""))
             else:
                 ok = int(y == int(gt))
                 per_img_rows.append((sid, img_disp, f"{s:.6f}", y, pred_name, int(gt), ok))
 
-        # —— 聚合为 sample 结果
+        # Aggregate per-sample
         scores_np = np.array(scores, dtype=float)
         mean_s = float(scores_np.mean())
         median_s = float(np.median(scores_np))
@@ -267,24 +271,24 @@ def main():
             per_smp_rows.append((sid, len(items_sorted), f"{mean_s:.6f}", f"{median_s:.6f}",
                                  f"{vote_fake:.1f}", verdict, int(gt), f"{smp_acc:.1f}", sample_correct))
 
-    # —— 导出 CSV
+    # Export CSV
     with open(OUT_PER_IMAGE_CSV, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(per_img_rows)
     with open(OUT_PER_SAMPLE_CSV, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(per_smp_rows)
 
-    # —— 终端打印（简表 + 总结）
-    print("\n【逐样本聚合结果】")
+    # Print summary tables
+    print("\n[Per-sample Aggregated Results]")
     headers_s = ["sample_id", "num_images", "mean_score", "median_score", "vote_fake(%)", "verdict"]
     rows_s = [[r[0], r[1], r[2], r[3], r[4], r[5]] for r in per_smp_rows[1:]]
     print_table(headers_s, rows_s)
 
-    print("\n【逐图结果（前 %d 条预览）】" % args.preview_n)
+    print(f"\n[Per-image Results (first {args.preview_n} samples preview)]")
     headers_i = ["sample_id", "image", "score_fake", "pred"]
     preview = [[r[0], r[1], r[2], r[4]] for r in per_img_rows[1:1 + args.preview_n]]
     print_table(headers_i, preview)
 
-    print("\n【全部预测汇总】")
+    print("\n[Overall Summary]")
     total_fake_samples = sample_pred_counter["fake"]
     total_real_samples = sample_pred_counter["real"]
     total_uncertain_samples = sample_pred_counter["uncertain"]
